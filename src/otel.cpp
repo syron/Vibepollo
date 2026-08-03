@@ -28,6 +28,7 @@
 #include "otel_exporter.h"
 #include "otel_logs.h"
 #include "platform/common.h"
+#include "process.h"
 #include "stream.h"
 #include "webrtc_stream.h"
 
@@ -97,7 +98,6 @@ namespace otel {
       session_history::session_metadata_t metadata;
       std::uint64_t start_time_unix_nano = 0;
       std::chrono::steady_clock::time_point start_steady {};
-      std::chrono::steady_clock::time_point last_accounted {};
       aggregator_t aggregator;
     };
 
@@ -113,9 +113,27 @@ namespace otel {
     std::mutex g_sessions_mutex;
     std::unordered_map<std::string, tracked_session_t> g_sessions;
 
+    /// Identity of the app the host is currently running.
+    struct active_app_t {
+      std::string name {"desktop"};
+      std::string uuid;
+      int app_id = -1;
+
+      bool operator==(const active_app_t &other) const {
+        return app_id == other.app_id && name == other.name && uuid == other.uuid;
+      }
+    };
+
     /// Cumulative streaming time per app, surviving individual sessions.
     std::mutex g_playtime_mutex;
     std::unordered_map<std::string, double> g_app_playtime_seconds;
+
+    /// Last app observed by the collector, used to detect switches. Collector
+    /// thread only, except for the initial value.
+    active_app_t g_last_active_app;
+    std::chrono::steady_clock::time_point g_playtime_last_accrued {};
+    bool g_playtime_started = false;
+    bool g_playtime_had_session = false;
 
     json g_resource;  ///< Written by init() and then only by the collector thread
     bool g_resource_pending_host_info = true;  ///< Collector thread only
@@ -475,22 +493,63 @@ namespace otel {
     }
 
     /**
+     * @brief Read the app the host is currently running.
+     *
+     * Deliberately resolved on every collection tick rather than captured once
+     * at session start: a client can quit one game and launch another without
+     * tearing down the stream, and attributing the whole session to whatever
+     * happened to be running first would make per-game totals wrong.
+     *
+     * Uses only the snapshot-returning accessors — @c current_app_id is an
+     * atomic and @c resolve_app copies under the app-list lock. The unlocked
+     * @c get_last_run_app_name / @c get_running_app_uuid are avoided on purpose:
+     * they read @c proc_t members that the launch path mutates concurrently, and
+     * they report the last app run rather than the one running now.
+     */
+    active_app_t read_active_app() {
+      active_app_t app;
+      app.app_id = proc::proc.current_app_id();
+
+      if (app.app_id <= 0) {
+        return app;  // nothing launched; the client is streaming the desktop
+      }
+
+      if (const auto ctx = proc::proc.resolve_app(app.app_id)) {
+        app.name = ctx->name.empty() ? "unknown" : ctx->name;
+        app.uuid = ctx->uuid;
+      } else {
+        // Launched from an entry that has since been removed from apps.json.
+        app.name = "unknown";
+      }
+
+      return app;
+    }
+
+    /**
      * @brief Attributes attached to every data point of one stream session.
      *
      * `app.name` is what makes "which game ran, for how long, at what cost"
      * answerable downstream, so it is carried on the metrics as well as on the
-     * lifecycle events.
+     * lifecycle events. It comes from the live lookup rather than the session
+     * metadata so a mid-session app switch is reflected immediately.
      */
-    json session_attributes(const std::string &uuid, const tracked_session_t *tracked, const char *protocol) {
+    json session_attributes(
+      const std::string &uuid,
+      const tracked_session_t *tracked,
+      const char *protocol,
+      const active_app_t &app
+    ) {
       json attributes = json::array();
       attributes.push_back(attr_string("session.id", uuid));
       attributes.push_back(attr_string("session.protocol", protocol));
+      attributes.push_back(attr_string("app.name", app.name));
+      if (!app.uuid.empty()) {
+        // Stable across renames in the web UI, unlike the display name.
+        attributes.push_back(attr_string("app.uuid", app.uuid));
+      }
 
       if (tracked) {
         const auto &meta = tracked->metadata;
-        if (!meta.app_name.empty()) {
-          attributes.push_back(attr_string("app.name", meta.app_name));
-        }
         if (!meta.client_name.empty()) {
           attributes.push_back(attr_string("client.name", meta.client_name));
         }
@@ -516,6 +575,7 @@ namespace otel {
     struct session_counters_t {
       std::string uuid;
       const char *protocol = "rtsp";
+      std::string state;  ///< "running", "starting", … ; empty when not reported
       std::uint64_t frames_sent = 0;
       std::uint64_t packets_sent = 0;
       std::uint64_t bytes_sent = 0;
@@ -529,7 +589,13 @@ namespace otel {
       int requested_bitrate_kbps = 0;
     };
 
-    void emit_session_metrics(metric_set_t &metrics, const session_counters_t &counters, double ts_seconds, std::uint64_t ts) {
+    void emit_session_metrics(
+      metric_set_t &metrics,
+      const session_counters_t &counters,
+      const active_app_t &app,
+      double ts_seconds,
+      std::uint64_t ts
+    ) {
       json attributes;
       std::uint64_t start_ts = g_process_start_unix_nano;
       double fps = 0;
@@ -540,7 +606,7 @@ namespace otel {
         std::lock_guard lk {g_sessions_mutex};
         auto it = g_sessions.find(counters.uuid);
         tracked_session_t *tracked = it != g_sessions.end() ? &it->second : nullptr;
-        attributes = session_attributes(counters.uuid, tracked, counters.protocol);
+        attributes = session_attributes(counters.uuid, tracked, counters.protocol, app);
 
         if (tracked) {
           start_ts = tracked->start_time_unix_nano;
@@ -549,6 +615,15 @@ namespace otel {
           bitrate_kbps = tracked->aggregator.actual_bitrate_kbps;
           jitter_ms = tracked->aggregator.jitter_ms;
         }
+      }
+
+      // State is reported as its own info series rather than as an attribute on
+      // the throughput counters: a transition would otherwise fork every one of
+      // those series and break rate queries across the boundary.
+      if (!counters.state.empty()) {
+        json state_attributes = attributes;
+        state_attributes.push_back(attr_string("session.state", counters.state));
+        metrics.gauge_int("vibepollo.session.state", "{info}", 1, state_attributes, ts);
       }
 
       metrics.gauge_double("vibepollo.session.uptime", "s", counters.uptime_seconds, attributes, ts);
@@ -576,62 +651,90 @@ namespace otel {
     }
 
     /**
-     * @brief Roll active-session wall time into the per-app playtime counters.
+     * @brief Credit elapsed wall time to the app that was running during it.
+     *
+     * Wall time, not summed per session: two clients watching the same game for
+     * an hour is one hour of playtime, not two. The interval is credited to the
+     * previously observed app rather than the current one, so the seconds before
+     * a switch are attributed to the game that was actually running.
+     *
+     * Collector thread only.
      */
-    void accrue_playtime() {
+    void accrue_playtime(const active_app_t &current, bool has_active_session) {
       const auto now = std::chrono::steady_clock::now();
-      std::vector<std::pair<std::string, double>> increments;
-
-      {
-        std::lock_guard lk {g_sessions_mutex};
-        for (auto &[uuid, tracked] : g_sessions) {
-          const double elapsed = std::chrono::duration<double>(now - tracked.last_accounted).count();
-          tracked.last_accounted = now;
-          if (elapsed > 0) {
-            increments.emplace_back(
-              tracked.metadata.app_name.empty() ? "unknown" : tracked.metadata.app_name,
-              elapsed
-            );
-          }
-        }
+      if (!g_playtime_started) {
+        g_playtime_started = true;
+        g_playtime_last_accrued = now;
+        g_last_active_app = current;
+        g_playtime_had_session = has_active_session;
+        return;
       }
 
-      std::lock_guard lk {g_playtime_mutex};
-      for (const auto &[app, seconds] : increments) {
-        g_app_playtime_seconds[app] += seconds;
+      const double elapsed = std::chrono::duration<double>(now - g_playtime_last_accrued).count();
+      g_playtime_last_accrued = now;
+
+      if (g_playtime_had_session && elapsed > 0) {
+        std::lock_guard lk {g_playtime_mutex};
+        g_app_playtime_seconds[g_last_active_app.name] += elapsed;
+      }
+      g_playtime_had_session = has_active_session;
+
+      if (!(current == g_last_active_app)) {
+        logs::emit_event(
+          "vibepollo.app.changed",
+          2,
+          "Active app changed: " + g_last_active_app.name + " -> " + current.name,
+          {
+            {"app.name", current.name},
+            {"app.uuid", current.uuid},
+            {"app.previous_name", g_last_active_app.name},
+            {"app.previous_uuid", g_last_active_app.uuid},
+            {"session.active", has_active_session ? "true" : "false"},
+          }
+        );
+        g_last_active_app = current;
       }
     }
 
-    void collect_playtime_metrics(metric_set_t &metrics, std::uint64_t ts) {
+    void collect_app_metrics(metric_set_t &metrics, const active_app_t &app, std::uint64_t ts) {
+      json attributes = json::array({attr_string("app.name", app.name)});
+      if (!app.uuid.empty()) {
+        attributes.push_back(attr_string("app.uuid", app.uuid));
+      }
+      metrics.gauge_int("vibepollo.app.active", "{info}", 1, attributes, ts);
+
       std::unordered_map<std::string, double> snapshot;
       {
         std::lock_guard lk {g_playtime_mutex};
         snapshot = g_app_playtime_seconds;
       }
 
-      for (const auto &[app, seconds] : snapshot) {
+      for (const auto &[name, seconds] : snapshot) {
         metrics.sum_double(
           "vibepollo.app.playtime",
           "s",
           seconds,
-          json::array({attr_string("app.name", app)}),
+          json::array({attr_string("app.name", name)}),
           g_process_start_unix_nano,
           ts
         );
       }
     }
 
-    void collect_session_metrics(metric_set_t &metrics, std::uint64_t ts) {
+    std::int64_t collect_session_metrics(metric_set_t &metrics, const active_app_t &app, std::uint64_t ts) {
       const double ts_seconds = now_unix_seconds();
       std::int64_t active = 0;
+      std::unordered_map<std::string, std::int64_t> by_state;
 
       for (const auto &info : stream::get_all_session_info()) {
         ++active;
+        ++by_state[info.state];
         emit_session_metrics(
           metrics,
           {
             .uuid = info.uuid,
             .protocol = "rtsp",
+            .state = info.state,
             .frames_sent = info.frames_sent,
             .packets_sent = info.packets_sent,
             .bytes_sent = info.bytes_sent,
@@ -644,6 +747,7 @@ namespace otel {
             .encoder_bitrate_kbps = info.encoder_bitrate_kbps,
             .requested_bitrate_kbps = info.requested_bitrate_kbps ? info.requested_bitrate_kbps : info.encoder_bitrate_kbps,
           },
+          app,
           ts_seconds,
           ts
         );
@@ -651,6 +755,13 @@ namespace otel {
 
       for (const auto &ws : webrtc_stream::list_sessions()) {
         ++active;
+
+        // WebRTC has no session state machine; derive an equivalent from the
+        // negotiation flags so both protocols report on the same series.
+        const char *webrtc_state = ws.has_local_answer ? "running" :
+                                   ws.has_remote_offer ? "starting" :
+                                                         "negotiating";
+        ++by_state[webrtc_state];
 
         double last_video_age_ms = 0;
         if (ws.last_video_time) {
@@ -665,6 +776,7 @@ namespace otel {
           {
             .uuid = ws.id,
             .protocol = "webrtc",
+            .state = webrtc_state,
             .frames_sent = static_cast<std::uint64_t>(ws.last_video_frame_index > 0 ? ws.last_video_frame_index : 0),
             .packets_sent = ws.video_packets,
             .bytes_sent = ws.video_bytes_total + ws.audio_bytes_total,
@@ -674,12 +786,24 @@ namespace otel {
             .encoder_bitrate_kbps = ws.bitrate_kbps.value_or(0),
             .requested_bitrate_kbps = ws.bitrate_kbps.value_or(0),
           },
+          app,
           ts_seconds,
           ts
         );
       }
 
       metrics.gauge_int("vibepollo.sessions.active", "{session}", active, json::array(), ts);
+      for (const auto &[state, count] : by_state) {
+        metrics.gauge_int(
+          "vibepollo.sessions.by_state",
+          "{session}",
+          count,
+          json::array({attr_string("session.state", state)}),
+          ts
+        );
+      }
+
+      return active;
     }
 
     void collect_build_info(metric_set_t &metrics, std::uint64_t ts) {
@@ -698,11 +822,14 @@ namespace otel {
     void export_metrics() {
       const auto ts = now_unix_nano();
 
+      const auto app = read_active_app();
+
       metric_set_t metrics;
       collect_build_info(metrics, ts);
       collect_host_metrics(metrics, ts);
-      collect_session_metrics(metrics, ts);
-      collect_playtime_metrics(metrics, ts);
+      const auto active_sessions = collect_session_metrics(metrics, app, ts);
+      accrue_playtime(app, active_sessions > 0);
+      collect_app_metrics(metrics, app, ts);
 
       if (metrics.empty()) {
         return;
@@ -795,10 +922,18 @@ namespace otel {
           g_resource_pending_host_info = false;
         }
 
-        accrue_playtime();
-
         if (settings.metrics_enabled) {
           export_metrics();
+        } else {
+          // Playtime and app-switch detection must keep running even when the
+          // metric signal is switched off, or the counters would jump on resume.
+          const auto app = read_active_app();
+          std::size_t sessions = 0;
+          {
+            std::lock_guard lk {g_sessions_mutex};
+            sessions = g_sessions.size();
+          }
+          accrue_playtime(app, sessions > 0);
         }
         if (settings.logs_enabled) {
           export_logs();
@@ -862,6 +997,13 @@ namespace otel {
       g_process_start_unix_nano = now_unix_nano();
       g_resource = build_resource();
       g_resource_pending_host_info = host_stats::info().cpu_model.empty();
+
+      // Re-baseline the playtime clock. Without this, a stop/start cycle from
+      // hot-apply would credit the entire disabled window to whatever app was
+      // running when export was switched off.
+      g_playtime_started = false;
+      g_playtime_had_session = false;
+      g_last_active_app = {};
 
       {
         std::lock_guard lk {g_settings_mutex};
@@ -963,25 +1105,28 @@ namespace otel {
       return;
     }
 
-    const auto now = std::chrono::steady_clock::now();
     {
       std::lock_guard lk {g_sessions_mutex};
       auto &tracked = g_sessions[metadata.uuid];
       tracked.metadata = metadata;
       tracked.start_time_unix_nano = now_unix_nano();
-      tracked.start_steady = now;
-      tracked.last_accounted = now;
+      tracked.start_steady = std::chrono::steady_clock::now();
       tracked.aggregator = {};
     }
+
+    // The app the client launches with is only a starting point — the live
+    // lookup in the collector owns attribution from here on.
+    const auto app = read_active_app();
 
     logs::emit_event(
       "vibepollo.session.started",
       2,
-      "Stream session started: " + (metadata.app_name.empty() ? std::string {"(desktop)"} : metadata.app_name),
+      "Stream session started: " + app.name,
       {
         {"session.id", metadata.uuid},
         {"session.protocol", metadata.protocol},
-        {"app.name", metadata.app_name},
+        {"app.name", app.name},
+        {"app.uuid", app.uuid},
         {"client.name", metadata.client_name},
         {"client.device", metadata.device_name},
         {"video.codec", metadata.codec},
@@ -1006,16 +1151,10 @@ namespace otel {
       if (auto it = g_sessions.find(uuid); it != g_sessions.end()) {
         found = true;
         metadata = it->second.metadata;
-        const auto now = std::chrono::steady_clock::now();
-        duration_seconds = std::chrono::duration<double>(now - it->second.start_steady).count();
-
-        // Close out the playtime interval before the session disappears.
-        const double unaccounted = std::chrono::duration<double>(now - it->second.last_accounted).count();
-        if (unaccounted > 0) {
-          std::lock_guard playtime_lk {g_playtime_mutex};
-          g_app_playtime_seconds[metadata.app_name.empty() ? "unknown" : metadata.app_name] += unaccounted;
-        }
-
+        duration_seconds = std::chrono::duration<double>(
+                             std::chrono::steady_clock::now() - it->second.start_steady
+        )
+                             .count();
         g_sessions.erase(it);
       }
     }
@@ -1024,14 +1163,19 @@ namespace otel {
       return;
     }
 
+    // Playtime for the tail of this session is settled by the collector on its
+    // next tick, which still sees the interval as having had an active session.
+    const auto app = read_active_app();
+
     logs::emit_event(
       "vibepollo.session.ended",
       2,
-      "Stream session ended: " + (metadata.app_name.empty() ? std::string {"(desktop)"} : metadata.app_name),
+      "Stream session ended: " + app.name,
       {
         {"session.id", uuid},
         {"session.protocol", metadata.protocol},
-        {"app.name", metadata.app_name},
+        {"app.name", app.name},
+        {"app.uuid", app.uuid},
         {"client.name", metadata.client_name},
         {"client.device", metadata.device_name},
         {"session.duration_seconds", std::to_string(duration_seconds)},

@@ -4231,6 +4231,8 @@ instead, so an existing collector environment works without repeating the config
 | `vibepollo.host.gpu.memory.utilization` | gauge | % |
 | `vibepollo.host.network.throughput` | gauge | bit/s |
 | `vibepollo.sessions.active` | gauge | {session} |
+| `vibepollo.sessions.by_state` | gauge | {session} |
+| `vibepollo.session.state` | gauge | {info} |
 | `vibepollo.session.uptime` | gauge | s |
 | `vibepollo.session.fps` / `.fps.target` | gauge | {frame}/s |
 | `vibepollo.session.bitrate` / `.bitrate.encoder` / `.bitrate.requested` | gauge | kbit/s |
@@ -4240,13 +4242,29 @@ instead, so an existing collector environment works without repeating the config
 | `vibepollo.session.packets.sent` / `.packets.lost` | cumulative sum | {packet} |
 | `vibepollo.session.bytes.sent` | cumulative sum | By |
 | `vibepollo.session.idr.requests` / `.reference.invalidations` | cumulative sum | {request} |
+| `vibepollo.app.active` | gauge | {info} |
 | `vibepollo.app.playtime` | cumulative sum | s |
 | `vibepollo.build.info` | gauge | {info} |
 
-Session series carry `session.id`, `session.protocol`, `app.name`, `client.name`, `client.device`,
-`video.codec`, `video.width`, `video.height`, `video.hdr` and `gpu.model` attributes, so usage can
-be broken down by game, by client, or by codec. `vibepollo.app.playtime` accumulates streaming time
-per `app.name` for the lifetime of the process.
+Session series carry `session.id`, `session.protocol`, `app.name`, `app.uuid`, `client.name`,
+`client.device`, `video.codec`, `video.width`, `video.height`, `video.hdr` and `gpu.model`
+attributes, so usage can be broken down by game, by client, or by codec.
+
+The app attributes are resolved on every collection tick rather than captured when the stream
+starts, so quitting one game and launching another without ending the session is reflected
+immediately. `app.uuid` is stable across renames in the web UI; `app.name` is the display name.
+When nothing has been launched, `app.name` is `desktop`.
+
+`vibepollo.app.active` reports which app is running right now (value 1, carrying the app
+attributes), independently of whether anyone is streaming it. `vibepollo.app.playtime` accumulates
+streaming wall time per app for the lifetime of the process — wall time, not summed per session, so
+two clients watching the same game for an hour is one hour.
+
+Session state (`stopped`, `stopping`, `starting`, `running`; WebRTC reports `negotiating`,
+`starting`, `running` derived from its negotiation flags) is published as the
+`vibepollo.session.state` info series and aggregated into `vibepollo.sessions.by_state`. It is
+deliberately kept off the throughput counters: carrying it as an attribute there would fork every
+one of those series on each transition and break rate queries across the boundary.
 
 ### Exported logs
 
@@ -4254,8 +4272,10 @@ Every record that reaches the console and the log file is also emitted as an OTL
 the Boost severity mapped onto the OTLP severity range. In addition, two discrete events are
 emitted with an `event.name` attribute:
 
-- `vibepollo.session.started` — carries app name, client, resolution, target FPS, codec and HDR
-- `vibepollo.session.ended` — carries app name, client and `session.duration_seconds`
+- `vibepollo.session.started` — carries app name and uuid, client, resolution, target FPS, codec, HDR
+- `vibepollo.session.ended` — carries app name and uuid, client and `session.duration_seconds`
+- `vibepollo.app.changed` — emitted when the running app changes, carrying both the new and the
+  previous app, so a mid-session switch is visible as a discrete event
 
 ### otel_enabled
 
