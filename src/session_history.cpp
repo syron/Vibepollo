@@ -13,6 +13,7 @@
 #include "config.h"
 #include "host_stats.h"
 #include "logging.h"
+#include "otel.h"
 #include "rtsp.h"
 #include "stream.h"
 #include "session_history_sampler.h"
@@ -87,13 +88,8 @@ namespace session_history {
   }
 
   void begin_session(const session_metadata_t &metadata) {
-    if (!history_available()) {
-      return;
-    }
-
-    BOOST_LOG(info) << "session_history: begin_session uuid=" << metadata.uuid
-                    << " protocol=" << metadata.protocol;
-
+    // Enrichment is cheap and OTLP export must not depend on SQLite persistence
+    // being enabled, so build the enriched record before the availability gate.
     session_metadata_t enriched = metadata;
     if (enriched.host_cpu_model.empty() || enriched.host_gpu_model.empty()) {
       const auto &info = host_stats::info();
@@ -110,6 +106,15 @@ namespace session_history {
     }
 #endif
     enriched.codec = stream::canonical_codec_name(enriched.codec);
+
+    otel::on_session_started(enriched);
+
+    if (!history_available()) {
+      return;
+    }
+
+    BOOST_LOG(info) << "session_history: begin_session uuid=" << enriched.uuid
+                    << " protocol=" << enriched.protocol;
 
     sampler::register_session(enriched);
 
@@ -128,6 +133,7 @@ namespace session_history {
 
   void end_session(const std::string &uuid) {
     sampler::unregister_session(uuid);
+    otel::on_session_ended(uuid);
 
     if (!history_available()) {
       return;

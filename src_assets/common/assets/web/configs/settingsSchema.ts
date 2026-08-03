@@ -716,6 +716,64 @@ export const settingsCategories: SettingsCategory[] = [
           }),
         ],
       },
+      {
+        id: 'host_opentelemetry',
+        fields: [
+          boolean('otel_enabled'),
+          text('otel_endpoint', {
+            monospace: true,
+            stacked: true,
+            visibleWhen: { key: 'otel_enabled', equals: true },
+          }),
+          text('otel_service_name', {
+            visibleWhen: { key: 'otel_enabled', equals: true },
+          }),
+          text('otel_headers', {
+            monospace: true,
+            stacked: true,
+            visibleWhen: { key: 'otel_enabled', equals: true },
+          }),
+          text('otel_resource_attributes', {
+            monospace: true,
+            stacked: true,
+            visibleWhen: { key: 'otel_enabled', equals: true },
+          }),
+          boolean('otel_metrics_enabled', {
+            visibleWhen: { key: 'otel_enabled', equals: true },
+          }),
+          boolean('otel_logs_enabled', {
+            visibleWhen: { key: 'otel_enabled', equals: true },
+          }),
+          select(
+            'otel_log_min_level',
+            [
+              option('0', 'ui.settings.options.log_level.verbose'),
+              option('1', 'ui.settings.options.log_level.debug'),
+              option('2', 'ui.settings.options.log_level.info'),
+              option('3', 'ui.settings.options.log_level.warning'),
+              option('4', 'ui.settings.options.log_level.error'),
+              option('5', 'ui.settings.options.log_level.fatal'),
+              option('6', 'ui.settings.options.log_level.none'),
+            ],
+            { visibleWhen: { key: 'otel_enabled', equals: true } },
+          ),
+          number('otel_export_interval_ms', {
+            min: 1000,
+            max: 3600000,
+            step: 1000,
+            visibleWhen: { key: 'otel_enabled', equals: true },
+          }),
+          number('otel_timeout_ms', {
+            min: 1000,
+            max: 120000,
+            step: 500,
+            visibleWhen: { key: 'otel_enabled', equals: true },
+          }),
+          boolean('otel_insecure_skip_verify', {
+            visibleWhen: { key: 'otel_enabled', equals: true },
+          }),
+        ],
+      },
     ],
   },
   {
@@ -819,6 +877,17 @@ export const settingsDefaults: Record<string, unknown> = {
   session_history_db_size_limit_mb: 0,
   realtime_stats_enabled: true,
   realtime_stats_poll_interval_ms: 2000,
+  otel_enabled: false,
+  otel_metrics_enabled: true,
+  otel_logs_enabled: true,
+  otel_endpoint: '',
+  otel_headers: '',
+  otel_service_name: 'vibepollo',
+  otel_resource_attributes: '',
+  otel_log_min_level: 2,
+  otel_export_interval_ms: 10000,
+  otel_timeout_ms: 10000,
+  otel_insecure_skip_verify: false,
 };
 
 export const knownSettingsKeys = new Set(

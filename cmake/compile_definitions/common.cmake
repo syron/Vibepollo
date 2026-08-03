@@ -142,6 +142,12 @@ set(SUNSHINE_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/session_history_writer.h"
         "${CMAKE_SOURCE_DIR}/src/host_stats.cpp"
         "${CMAKE_SOURCE_DIR}/src/host_stats.h"
+        "${CMAKE_SOURCE_DIR}/src/otel.cpp"
+        "${CMAKE_SOURCE_DIR}/src/otel.h"
+        "${CMAKE_SOURCE_DIR}/src/otel_exporter.cpp"
+        "${CMAKE_SOURCE_DIR}/src/otel_exporter.h"
+        "${CMAKE_SOURCE_DIR}/src/otel_logs.cpp"
+        "${CMAKE_SOURCE_DIR}/src/otel_logs.h"
         ${PLATFORM_TARGET_FILES})
 
 if(NOT SUNSHINE_ASSETS_DIR_DEF)

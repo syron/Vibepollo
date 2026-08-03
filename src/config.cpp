@@ -46,6 +46,7 @@
 #include "platform/common.h"
 #include "process.h"
 #include "rtsp.h"
+#include "otel.h"
 #include "session_history.h"
 #include "state_storage.h"
 #include "stream.h"
@@ -1078,6 +1079,9 @@ namespace config {
     0  // session_history_db_size_limit_mb (disabled by default)
   };
 
+  // Defaults live in the struct declaration; OTLP export is opt-in.
+  otel_t otel {};
+
   namespace {
     const video_t default_video = video;
     const audio_t default_audio = audio;
@@ -1087,6 +1091,7 @@ namespace config {
     const rtss_t default_rtss = rtss;
     const lossless_scaling_t default_lossless_scaling = lossless_scaling;
     const sunshine_t default_sunshine = sunshine;
+    const otel_t default_otel = otel;
 
     std::unordered_map<std::string, std::string> command_line_overrides;
 
@@ -1104,6 +1109,7 @@ namespace config {
       frame_limiter = default_frame_limiter;
       rtss = default_rtss;
       lossless_scaling = default_lossless_scaling;
+      otel = default_otel;
 
       sunshine = default_sunshine;
       sunshine.username = preserved_username;
@@ -2258,6 +2264,21 @@ namespace config {
     bool_f(vars, "realtime_stats_enabled", sunshine.realtime_stats_enabled);
     int_between_f(vars, "realtime_stats_poll_interval_ms", sunshine.realtime_stats_poll_interval_ms, {250, 60000});
 
+    bool_f(vars, "otel_enabled", otel.enabled);
+    bool_f(vars, "otel_metrics_enabled", otel.metrics_enabled);
+    bool_f(vars, "otel_logs_enabled", otel.logs_enabled);
+    string_f(vars, "otel_endpoint", otel.endpoint);
+    string_f(vars, "otel_metrics_endpoint", otel.metrics_endpoint);
+    string_f(vars, "otel_logs_endpoint", otel.logs_endpoint);
+    string_f(vars, "otel_headers", otel.headers);
+    string_f(vars, "otel_service_name", otel.service_name);
+    string_f(vars, "otel_service_namespace", otel.service_namespace);
+    string_f(vars, "otel_resource_attributes", otel.resource_attributes);
+    int_between_f(vars, "otel_export_interval_ms", otel.export_interval_ms, {1000, 3600000});
+    int_between_f(vars, "otel_timeout_ms", otel.timeout_ms, {1000, 120000});
+    int_between_f(vars, "otel_log_min_level", otel.log_min_level, {0, 6});
+    bool_f(vars, "otel_insecure_skip_verify", otel.insecure_skip_verify);
+
     // Web-UI-only realtime stats preferences; consumed here so they are not
     // reported as unrecognized options.
     for (const auto *ui_only_key : {
@@ -3125,6 +3146,7 @@ namespace config {
         g_deferred_reload.store(true, std::memory_order_release);
       }
       session_history::reload_settings();
+      otel::reload_settings();
 
       // If only the log level changed, we can reconfigure sinks in place.
       if (sunshine.min_log_level != old_min_level && sunshine.log_file == old_log_file) {

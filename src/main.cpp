@@ -24,6 +24,7 @@
 #include "logging.h"
 #include "main.h"
 #include "nvhttp.h"
+#include "otel.h"
 #include "process.h"
 #include "rtsp.h"
 #include "system_tray.h"
@@ -266,6 +267,14 @@ int main(int argc, char *argv[]) {
   if (!log_deinit_guard) {
     BOOST_LOG(error) << "Logging failed to initialize"sv;
   }
+
+  // Start OTLP export right after logging so the log bridge captures almost the
+  // entire process lifetime. No-op unless otel_enabled is set. Declared after
+  // log_deinit_guard so it tears down before the logging core does.
+  otel::init();
+  auto otel_shutdown_guard = util::fail_guard([]() {
+    otel::shutdown();
+  });
 
 #ifdef _WIN32
   const auto app_user_model_id_status =

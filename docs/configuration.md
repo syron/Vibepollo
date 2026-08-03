@@ -4203,6 +4203,277 @@ playnite_exclude_categories = ["Steam", {"id": "deck", "name": "Steam Deck"}]
     </tr>
 </table>
 
+## OpenTelemetry
+
+Vibepollo can export the counters it already tracks — host CPU/GPU/RAM/VRAM/network usage and
+per-session streaming statistics — as OpenTelemetry metrics, and mirror its log stream as
+OpenTelemetry log records. Both signals are sent over OTLP/HTTP with a JSON body, so any collector
+that accepts OTLP works (the OpenTelemetry Collector, Grafana Alloy, and hosted backends alike).
+
+Export is independent of @ref session_history_enabled "session history persistence": you can stream
+telemetry to a collector without keeping a local SQLite database.
+
+Where a setting is left empty, the corresponding standard `OTEL_*` environment variable is used
+instead, so an existing collector environment works without repeating the configuration here.
+
+### Exported metrics
+
+| Metric | Type | Unit |
+|--------|------|------|
+| `vibepollo.host.cpu.utilization` | gauge | % |
+| `vibepollo.host.cpu.temperature` | gauge | Cel |
+| `vibepollo.host.memory.usage` / `.limit` | gauge | By |
+| `vibepollo.host.memory.utilization` | gauge | % |
+| `vibepollo.host.gpu.utilization` | gauge | % |
+| `vibepollo.host.gpu.encoder.utilization` | gauge | % |
+| `vibepollo.host.gpu.temperature` | gauge | Cel |
+| `vibepollo.host.gpu.memory.usage` / `.limit` | gauge | By |
+| `vibepollo.host.gpu.memory.utilization` | gauge | % |
+| `vibepollo.host.network.throughput` | gauge | bit/s |
+| `vibepollo.sessions.active` | gauge | {session} |
+| `vibepollo.session.uptime` | gauge | s |
+| `vibepollo.session.fps` / `.fps.target` | gauge | {frame}/s |
+| `vibepollo.session.bitrate` / `.bitrate.encoder` / `.bitrate.requested` | gauge | kbit/s |
+| `vibepollo.session.encode.latency` | gauge | ms |
+| `vibepollo.session.frame_interval.jitter` | gauge | ms |
+| `vibepollo.session.frames.sent` | cumulative sum | {frame} |
+| `vibepollo.session.packets.sent` / `.packets.lost` | cumulative sum | {packet} |
+| `vibepollo.session.bytes.sent` | cumulative sum | By |
+| `vibepollo.session.idr.requests` / `.reference.invalidations` | cumulative sum | {request} |
+| `vibepollo.app.playtime` | cumulative sum | s |
+| `vibepollo.build.info` | gauge | {info} |
+
+Session series carry `session.id`, `session.protocol`, `app.name`, `client.name`, `client.device`,
+`video.codec`, `video.width`, `video.height`, `video.hdr` and `gpu.model` attributes, so usage can
+be broken down by game, by client, or by codec. `vibepollo.app.playtime` accumulates streaming time
+per `app.name` for the lifetime of the process.
+
+### Exported logs
+
+Every record that reaches the console and the log file is also emitted as an OTLP log record, with
+the Boost severity mapped onto the OTLP severity range. In addition, two discrete events are
+emitted with an `event.name` attribute:
+
+- `vibepollo.session.started` — carries app name, client, resolution, target FPS, codec and HDR
+- `vibepollo.session.ended` — carries app name, client and `session.duration_seconds`
+
+### otel_enabled
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td>
+            Master switch for OpenTelemetry export. When disabled, no collector thread is started and
+            the log bridge is not attached.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td>@code{}false@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td>@code{}otel_enabled = true@endcode</td>
+    </tr>
+</table>
+
+### otel_endpoint
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td>
+            Base URL of the OTLP/HTTP collector. The paths <code>/v1/metrics</code> and
+            <code>/v1/logs</code> are appended automatically. Falls back to the
+            <code>OTEL_EXPORTER_OTLP_ENDPOINT</code> environment variable when empty. Use
+            <code>otel_metrics_endpoint</code> or <code>otel_logs_endpoint</code> to override a single
+            signal with a full URL.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td>@code{}@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td>@code{}otel_endpoint = http://192.168.1.10:4318@endcode</td>
+    </tr>
+</table>
+
+### otel_headers
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td>
+            Extra request headers as comma-separated <code>key=value</code> pairs, typically an ingest
+            token. Falls back to <code>OTEL_EXPORTER_OTLP_HEADERS</code>. This value is redacted from
+            the configuration log.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td>@code{}@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td>@code{}otel_headers = authorization=Bearer abc123@endcode</td>
+    </tr>
+</table>
+
+### otel_service_name
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td>
+            Value reported as the <code>service.name</code> resource attribute. Falls back to
+            <code>OTEL_SERVICE_NAME</code>.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td>@code{}vibepollo@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td>@code{}otel_service_name = livingroom-host@endcode</td>
+    </tr>
+</table>
+
+### otel_resource_attributes
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td>
+            Extra resource attributes as comma-separated <code>key=value</code> pairs, applied to every
+            metric and log record. Falls back to <code>OTEL_RESOURCE_ATTRIBUTES</code>.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td>@code{}@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td>@code{}otel_resource_attributes = deployment.environment=home,location=basement@endcode</td>
+    </tr>
+</table>
+
+### otel_metrics_enabled
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td>Export host and per-session metrics.</td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td>@code{}true@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td>@code{}otel_metrics_enabled = false@endcode</td>
+    </tr>
+</table>
+
+### otel_logs_enabled
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td>Mirror the log stream and session lifecycle events as OTLP log records.</td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td>@code{}true@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td>@code{}otel_logs_enabled = false@endcode</td>
+    </tr>
+</table>
+
+### otel_log_min_level
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td>
+            Lowest severity mirrored to the collector, on the same scale as
+            <code>min_log_level</code> (0 verbose … 5 fatal, 6 none). Records below
+            <code>min_log_level</code> never reach the bridge, so this only narrows the stream further.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td>@code{}2@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td>@code{}otel_log_min_level = 3@endcode</td>
+    </tr>
+</table>
+
+### otel_export_interval_ms
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td>How often metrics are collected and shipped. Range 1000–3600000.</td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td>@code{}10000@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td>@code{}otel_export_interval_ms = 5000@endcode</td>
+    </tr>
+</table>
+
+### otel_timeout_ms
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td>
+            Per-request timeout for OTLP exports. Failed exports are retried with exponential backoff
+            before being dropped; the queue is bounded so a collector outage cannot grow memory
+            without limit.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td>@code{}10000@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td>@code{}otel_timeout_ms = 5000@endcode</td>
+    </tr>
+</table>
+
+### otel_insecure_skip_verify
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td>
+            Skip TLS certificate verification when the endpoint uses <code>https</code>. Only enable
+            this for a collector on your own network that presents a self-signed certificate.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td>@code{}false@endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td>@code{}otel_insecure_skip_verify = true@endcode</td>
+    </tr>
+</table>
+
 <div class="section_buttons">
 
 | Previous          |                            Next |

@@ -1522,6 +1522,10 @@
         "host_history": {
           "title": "History and live diagnostics"
         },
+        "host_opentelemetry": {
+          "description": "Ship host and stream telemetry to an OpenTelemetry collector over OTLP/HTTP.",
+          "title": "OpenTelemetry export"
+        },
         "host_identity": {
           "title": "Identity and local behavior"
         },

@@ -34,7 +34,8 @@ namespace config {
   inline std::unordered_map<std::string, std::string> pending_config_settings;
 
   inline constexpr std::array redacted_config = {
-    "csrf_allowed_origins"
+    "csrf_allowed_origins",
+    "otel_headers"  // may carry a collector ingest token
   };
 
   void log_config_settings(const std::unordered_map<std::string, std::string> &vars, bool save);
@@ -464,6 +465,41 @@ namespace config {
     int realtime_stats_poll_interval_ms {2000};  ///< Host stats sampler interval in milliseconds
   };
 
+  /**
+   * @brief OpenTelemetry (OTLP/HTTP) export settings.
+   *
+   * Endpoint, header and resource settings fall back to the standard
+   * OTEL_* environment variables when left empty, so an existing collector
+   * environment works without duplicating configuration here.
+   */
+  struct otel_t {
+    bool enabled {false};  ///< Master switch for the OTLP pipeline
+    bool metrics_enabled {true};  ///< Export host and stream metrics
+    bool logs_enabled {true};  ///< Mirror the log stream as OTLP log records
+
+    /// Collector base URL; `/v1/metrics` and `/v1/logs` are appended.
+    /// Falls back to OTEL_EXPORTER_OTLP_ENDPOINT.
+    std::string endpoint;
+    /// Full URL overrides for a single signal (optional).
+    std::string metrics_endpoint;
+    std::string logs_endpoint;
+
+    /// `key=value,key2=value2` request headers, e.g. an ingest token.
+    /// Falls back to OTEL_EXPORTER_OTLP_HEADERS.
+    std::string headers;
+
+    std::string service_name {"vibepollo"};  ///< Falls back to OTEL_SERVICE_NAME
+    std::string service_namespace;  ///< Optional service.namespace resource attribute
+    /// Extra `key=value,...` resource attributes.
+    /// Falls back to OTEL_RESOURCE_ATTRIBUTES.
+    std::string resource_attributes;
+
+    int export_interval_ms {10000};  ///< Collection and export cadence
+    int timeout_ms {10000};  ///< Per-request timeout
+    int log_min_level {2};  ///< Lowest severity mirrored to OTLP (matches min_log_level scale)
+    bool insecure_skip_verify {false};  ///< Skip TLS verification (self-signed collectors)
+  };
+
   extern video_t video;
   extern audio_t audio;
   extern stream_t stream;
@@ -473,6 +509,7 @@ namespace config {
   extern rtss_t rtss;
   extern lossless_scaling_t lossless_scaling;
   extern sunshine_t sunshine;
+  extern otel_t otel;
 
   int parse(int argc, char *argv[]);
   std::unordered_map<std::string, std::string> parse_config(const std::string_view &file_content);
